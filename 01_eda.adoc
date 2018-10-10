@@ -1,0 +1,210 @@
+
+++++
+<script type="text/javascript"
+  src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.2/MathJax.js?config=TeX-MML-AM_CHTML">
+</script>
+
+<!-- Configure and load Thebe !-->
+<script type="text/x-thebe-config">
+  {
+    bootstrap: true,
+    kernelOptions: {
+      name: "python3",
+      serverSettings: {
+        "baseUrl": "http://127.0.0.1:8888",
+        "token": "test-secret"
+      }
+    },
+    selector: "[data-lang]"
+  }
+</script>
+<script type="text/javascript" src="https://unpkg.com/thebelab@^0.3.0" ></script>
+++++
+
+= Data Science and Machine Learning Training
+
+Welcome to this online course on Data Science and Machine Learning with Neo4j.
+This course will take approximately 90 minutes to complete.
+
+You will learn:
+
+* How to integrate Neo4j with popular Python libraries such as Pandas and matplotlib
+* How to build a similarity graph
+* How to use that similarity graph as part of kNN predictions
+* How to execute Linear Regression on graph data
+* Graph Embeddings
+
+We'll be using a rental listing dataset for the examples.
+It's already been loaded into Neo4j so we won't be covering anything related to data import in this session.
+
+== Exploratory Data Analysis
+
+Let's start by getting familiar with the dataset.
+
+First we'll import the libraries that we're going to use in this session.
+
+[source, python]
+----
+%matplotlib inline
+
+from py2neo import Graph
+import pandas as pd
+
+import matplotlib
+import matplotlib.pyplot as plt
+plt.style.use('fivethirtyeight')
+----
+
+Or even do some cooler stuff:
+
+[source, python]
+----
+graph = Graph("bolt://localhost", auth=("neo4j", "neo"))
+----
+
+Let's connect to the database:
+
+[source, python]
+----
+query = """
+CALL db.schema()
+"""
+
+graph.run(query).data()
+----
+
+How many nodes will we be working with?
+
+[source, python]
+----
+query = """
+MATCH ()
+RETURN COUNT(*) AS nodeCount
+"""
+
+graph.run(query).to_data_frame()
+----
+
+What type of nodes do we have?
+
+[source, python]
+----
+result = {"label": [], "count": []}
+for label in graph.run("CALL db.labels()").to_series():
+    query = f"MATCH (:`{label}`) RETURN count(*) as count"
+    count = graph.run(query).to_data_frame().iloc[0]['count']
+    result["label"].append(label)
+    result["count"].append(count)
+nodes_df = pd.DataFrame(data=result)
+nodes_df.sort_values("count")
+----
+
+Let's visualize that with matplotlib:
+
+[source, python]
+----
+nodes_df.plot(kind='bar', x='label', y='count', legend=None, title="Node Cardinalities")
+plt.yscale("log")
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+----
+
+What about relationships?
+
+[source, python]
+----
+result = {"relType": [], "count": []}
+for relationship_type in graph.run("CALL db.relationshipTypes()").to_series():
+    query = f"MATCH ()-[:`{relationship_type}`]->() RETURN count(*) as count"
+    count = graph.run(query).to_data_frame().iloc[0]['count']
+    result["relType"].append(relationship_type)
+    result["count"].append(count)
+rels_df = pd.DataFrame(data=result)
+rels_df.sort_values("count")
+----
+
+Unleash the matplotlib
+
+[source, python]
+----
+rels_df.plot(kind='bar', x='relType', y='count', legend=None, title="Relationship Cardinalities")
+plt.yscale("log")
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+----
+
+Time to explore the neighborhoods:
+
+[source, python]
+----
+exploratory_query = """
+MATCH (n:Neighborhood)<-[:IN_NEIGHBORHOOD]-(l:Listing)-[:HAS]->(a:Amenity)
+RETURN n.name AS neighborhood, l.name AS name, collect(a.name) AS amenities, l.price AS price
+LIMIT 25
+"""
+
+graph.run(exploratory_query).to_data_frame()
+----
+
+What does the distribution of prices in the dataset look like? We can use the describe function to work this out:
+
+[source, python]
+----
+query = """
+MATCH (l:Listing)
+RETURN l.price AS price
+"""
+
+price_df = graph.run(query).to_data_frame()
+price_df.describe()
+----
+
+This returns some descriptive statistics that allow us to get an understanding of how prices are distributed.
+We can see that the average price is 139 per night, but the maximum price is 999 - there's clearly a lot of variation in prices!
+
+[source,python]
+----
+fig1, ax1 = plt.subplots()
+ax1.hist(pd.Series(price_df['price'].dropna()), 20, density=True, facecolor='g', alpha=0.75)
+plt.tight_layout()
+plt.show()
+----
+
+We have a very long tail going on here - the majority of listings are priced at under 200, but then there are a few properties that cost much more than this.
+
+What are the most expensive places to live?
+
+[source,python]
+----
+query = """
+MATCH (l:Listing)-[:IN_NEIGHBORHOOD]->(n:Neighborhood)
+WITH n, avg(l.price) AS averagePrice
+RETURN n.id AS zip, n.name AS neighborhood, averagePrice
+"""
+
+price_df = graph.run(query).to_data_frame().sort_values("averagePrice", ascending=False)
+price_df.head(10)
+----
+
+The variation in average price by neighborhood is easier to see in a chart:
+
+[source,python]
+----
+price_df.head(30).plot(kind='bar', x='zip', y='averagePrice', legend=None, title="Average price")
+plt.tight_layout()
+plt.show()
+----
+
+== Exercise
+
+* Can you create a similar chart showing the areas which are offering the largest number of bedrooms?
+* What about bathrooms?
+* What about the number of listings per neighborhood?
+
+++++
+<script type="text/javascript">
+document.getElementById('origin').innerHTML = location.origin;
+</script>
+++++

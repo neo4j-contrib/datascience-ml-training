@@ -1,0 +1,328 @@
+
+++++
+<script type="text/javascript"
+  src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.2/MathJax.js?config=TeX-MML-AM_CHTML">
+</script>
+
+<!-- Configure and load Thebe !-->
+<script type="text/x-thebe-config">
+  {
+    bootstrap: true,
+    kernelOptions: {
+      name: "python3",
+      serverSettings: {
+        "baseUrl": "http://127.0.0.1:8888",
+        "token": "test-secret"
+      }
+    },
+    selector: "[data-lang]"
+  }
+</script>
+<script type="text/javascript" src="https://unpkg.com/thebelab@^0.3.0" ></script>
+++++
+
+= Data Science and Machine Learning Training
+
+In the next section we'll learn how to create recommendations.
+
+== Recommendations
+
+As in the previous section, let's first import some libraries:
+
+[source, python]
+----
+from py2neo import Graph
+import pandas as pd
+
+pd.set_option('display.max_colwidth', -1)
+----
+
+And create our graph:
+
+[source, python]
+----
+graph = Graph("bolt://localhost", auth=("neo4j", "neo"))
+----
+
+
+Since we're going to make listing suggestions so let's find some users who have written the most reviews so that we have some data to work with.
+
+[source, python]
+----
+popular_users_query = """
+MATCH (u:User)
+RETURN u.id AS id, u.name AS user, size((u)-[:WROTE]->()) AS reviews
+ORDER BY reviews DESC
+LIMIT 10
+"""
+
+graph.run(popular_users_query).to_data_frame()
+----
+
+
+We can probably pick anyone from this list but 'Salvador' happens to have written reviews of places that have also been reviewed by other people so we'll use him for our example.
+
+The following query finds the listings that Salvador has reviewed the most:
+
+[source, python]
+----
+user_query = """
+MATCH (u:User {id: $userId})-[:WROTE]->(review)-[:REVIEWS]->(listing:Listing)-[:IN_NEIGHBORHOOD]->(nh)
+RETURN listing.id, listing.name, listing.propertyType, nh.name, count(*) AS times
+ORDER BY times DESC
+"""
+
+user_id = "141581986"
+
+graph.run(user_query, {"userId": user_id}).to_data_frame()
+----
+
+It looks like Salvador stays in places near to La Guardia Airport based on the names of the listings.
+
+The following query finds users who have reviewed the same places as Salvador:
+
+[source, python]
+----
+
+similar_users_query = """
+MATCH (u:User {id: $userId})-[:WROTE]->()-[:REVIEWS]->(listing:Listing),
+      (other)-[:WROTE]->()-[:REVIEWS]->(listing)
+WHERE u <> other
+WITH other, count(distinct listing) AS commonListings
+RETURN other.id, other.name, commonListings
+ORDER BY commonListings DESC
+LIMIT 10
+"""
+
+graph.run(similar_users_query, {"userId": user_id}).to_data_frame()
+----
+
+We'll return to these users in the next section.
+
+=== Collaborative Filtering
+
+https://towardsdatascience.com/various-implementations-of-collaborative-filtering-100385c6dfe0[Collaborative filtering^] is based on the assumption that people like things similar to other things they like, and things that are liked by other people with similar taste.
+
+image::https://camo.githubusercontent.com/f478bf17911efabed0deedcb64ad99c5c3532980/68747470733a2f2f63646e2d696d616765732d312e6d656469756d2e636f6d2f6d61782f313630302f312a365f4e6c5836434a596874787a524d2d743679776b512e706e67[]
+
+We can use a simple variant of this approach to find listings that were reviewed by people who stayed in other places that Salvador reviewed:
+
+[source, python]
+----
+collabarative_filtering_query = """
+MATCH (u:User {id: $userId})-[:WROTE]->()-[:REVIEWS]->(listing:Listing),
+      (other)-[:WROTE]->()-[:REVIEWS]->(listing)
+WHERE u <> other
+WITH u, other, count(distinct listing) AS commonListings
+ORDER BY commonListings DESC
+LIMIT 10
+MATCH (other)-[:WROTE]->(review)-[:REVIEWS]->(listing)
+WHERE not((u)-[:WROTE]->()-[:REVIEWS]->(listing))
+RETURN listing, [user in collect(DISTINCT other) | user.name] AS users
+ORDER BY size(users) DESC
+LIMIT 10
+"""
+
+graph.run(collabarative_filtering_query, {"userId": user_id}).to_data_frame()
+----
+
+The previous query considered users to be similar to each other if they've written reviews on the same listings, but we could do something more sophisticated.
+
+We want to work out similar users for each user using a similarity measure (e.g. Jaccard, Cosine, Pearson).
+These algorithms have a complexity of O(n^2) so let's check how many users we have before we do this:
+
+[source, python]
+----
+user_query = """
+MATCH (u:User)
+RETURN count(*)
+"""
+
+graph.run(user_query).to_data_frame()
+----
+
+
+We have more than 800,000 users which would result in more than 770 billion comparisons to work out similarity scores.
+That will take a long time so we need to find a way to reduce the number of comparisons that we need to do.
+
+One way to do this is by clustering our users using the Label Propagation algorithm.
+We can then run a similarity algorithm on these small sets of users.
+
+[source, python]
+----
+clustering_query = """
+CALL algo.labelPropagation(
+  "MATCH (u:User) WITH u SKIP {skip} LIMIT {limit} RETURN id(u) AS id",
+  "MATCH (u1:User) WITH u1 SKIP {skip} LIMIT {limit} MATCH (u1:User)-[:WROTE]->()-[:REVIEWS]->()<-[:REVIEWS]-()<-[:WROTE]-(u2)
+   return id(u1) AS source, id(u2) AS target, count(*) AS weight", "BOTH",
+  {graph: "cypher", batchSize: 100, partitionProperty: "partition"}
+)
+"""
+
+# graph.run(clustering_query).data()
+----
+
+
+If you want to run the query in the previous cell you can uncomment the last line, but it takes about 10 minutes to complete, so rather than run that we can load the results from a pre computed CSV file.
+
+[source, python]
+----
+load_pre_computed_csv_query = """
+USING PERIODIC COMMIT 1000
+LOAD CSV WITH HEADERS FROM $csvFile AS row
+MATCH (u:User {id: row.userId})
+SET u.partition = toInteger(row.partition)
+"""
+
+csv_file = "https://github.com/neo4j-contrib/training/raw/master/ml_ai/partitions.csv"
+graph.run(load_pre_computed_csv_query, {"csvFile": csv_file}).summary().counters
+----
+
+Let's see how many users we have in each partition:
+
+[source, python]
+----
+cluster_query = """
+MATCH (u:User)
+WHERE exists(u.partition)
+RETURN u.partition AS partition, count(*) AS count
+ORDER BY count DESC
+LIMIT 10
+"""
+
+clusters = graph.run(cluster_query).to_table()
+clusters
+----
+
+Our next step could be to iterate through each of the partitions and calculate the similarity of users in each partition, but rather than doing that we'll just calculate the similarity of people in the same cluster as Salvador.
+
+The following query finds the cluster containing Salvador:
+
+[source,python]
+----
+user_query = """
+MATCH (u:User {id: $userId})
+WITH u.partition AS partition, id(u) AS userId
+MATCH (u:User {partition: partition})
+RETURN partition, count(*), userId
+"""
+
+result = graph.run(user_query, {"userId": user_id}).to_table()
+partition, _, user_node_id = result[0]
+result
+----
+
+Next we'll calculate the similarity of users in that cluster, and then filter the results to show users that are similar to Salvador:
+
+[source,python]
+----
+similarity_query = """
+MATCH (u:User {partition: $cluster})
+MATCH (u)-[:WROTE]->()-[:REVIEWS]->(l)
+WITH {item:id(u), categories: collect(distinct id(l))} as userData
+WITH collect(userData) as data
+CALL algo.similarity.jaccard.stream(data, {similarityCutoff: 0.0})
+YIELD item1, item2, count1, count2, intersection, similarity
+WHERE item1 = $userNodeId or item2 = $userNodeId
+RETURN item1, item2, count1, count2, intersection, similarity
+ORDER BY similarity DESC
+LIMIT 10
+"""
+
+result = graph.run(similarity_query, {"cluster": partition, "userNodeId": user_node_id}).to_table()
+result
+----
+
+[source,python]
+----
+similarity_query = """
+MATCH (u:User {partition: $cluster})
+MATCH (u)-[:WROTE]->()-[:REVIEWS]->(l)
+WITH {item:id(u), categories: collect(distinct id(l))} as userData
+WITH collect(userData) as data
+CALL algo.similarity.jaccard(data, {similarityCutoff: 0.0, write: false})
+YIELD nodes, min, max, mean, stdDev, p25, p50, p75, p90, p95, p99, p999, p100, similarityPairs
+RETURN nodes, min, max, mean, stdDev, p25, p50, p75, p90, p95, p99, p999, p100, similarityPairs
+"""
+
+result = graph.run(similarity_query, {"cluster": partition}).to_table()
+result
+----
+
+
+In this example we set write to false, which means that no relationships are created between similar users.
+If we do want to create relationships between users we may prefer to pass in the topK parameter, which will find the k most similar users.
+
+Let's run the Jaccard Similarity algorithm again, but this time with topK=3, which will find 3 similar users for each user.
+We'll also set similarityCutoff=0.2 to filter out users who may have only one listing in common.
+
+[source,python]
+----
+similarity_query = """
+MATCH (u:User {partition: $cluster})
+MATCH (u)-[:WROTE]->()-[:REVIEWS]->(l)
+WITH {item:id(u), categories: collect(distinct id(l))} as userData
+WITH collect(userData) as data
+CALL algo.similarity.jaccard(data, {similarityCutoff: 0.2, topK:3, write: true})
+YIELD nodes, similarityPairs, writeProperty, writeRelationshipType
+RETURN nodes, similarityPairs, writeProperty, writeRelationshipType
+"""
+
+result = graph.run(similarity_query, {"cluster": partition}).to_table()
+result
+----
+
+Let's see what Salvador's similarity sub graph looks like:
+
+[source,python]
+----
+similar_query = """
+MATCH path = (:User {id: $userId})-[:SIMILAR]-(other)
+RETURN path
+"""
+
+graph.run(similar_query, {"userId": user_id}).to_table()
+----
+
+We can now write a query to find out what listings the people who are similar to Salvador have reviewed:
+
+[source,python]
+----
+similar_query = """
+MATCH (:User {id: $userId})-[:SIMILAR]-(other),
+      (other)-[:WROTE]->()-[:REVIEWS]->(listing)
+RETURN DISTINCT other.name, listing.id, listing.name
+ORDER BY other.name
+"""
+
+graph.run(similar_query, {"userId": user_id}).to_table()
+----
+
+Now let's see if any of these listings are ones that Salvador hasn't previously stayed at:
+
+[source,python]
+----
+recommendations_query = """
+MATCH (u:User {id: $userId})-[:SIMILAR]-(other),
+      (other)-[:WROTE]->(review)-[:REVIEWS]->(listing)
+WHERE not((u)-[:WROTE]->()-[:REVIEWS]->(listing))
+RETURN listing.id, listing.name, listing.propertyType, listing.bedrooms, listing.price, collect(DISTINCT other.name) AS people
+ORDER BY size(people) DESC
+"""
+
+graph.run(recommendations_query, {"userId": user_id}).to_table()
+----
+
+We could now make these suggestions to Salvador next time that he's looking for a place to stay.
+
+== Exercise
+
+* Have a look at Salvador's similarity graph in the Neo4j Browser - do the similar users make sense?
+* Can you write a query to make recommendations for somebody else in the same cluster as Salvador?
+* Can we use the Cosine Similarity procedure (with arrays of numeric properties e.g. number of bathrooms, bedrooms) to calculate listing similarities?
+
+++++
+<script type="text/javascript">
+document.getElementById('origin').innerHTML = location.origin;
+</script>
+++++

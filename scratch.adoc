@@ -1,0 +1,6 @@
+And now let's run a query to find movies and actors:
+
+[source, python]
+----
+include::code.py[tag=find-movies]
+----
